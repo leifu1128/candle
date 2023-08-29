@@ -197,21 +197,28 @@ impl Tensor {
                         kernel,
                         padding,
                         stride,
+                        dilation,
                     } => {
                         // The output height for conv_transpose2d is:
                         // (i_h - 1) * stride - 2 * padding + dilation * (k_h - 1) + out_padding + 1
                         let grad_h = grad.dim(2)?;
                         let k_h = kernel.dim(2)?;
-                        let out_size = (grad_h - 1) * stride + (k_h - 1) + 1 - 2 * padding;
+                        let out_size =
+                            (grad_h - 1) * stride + dilation * (k_h - 1) + 1 - 2 * padding;
                         let out_padding = arg.dim(2)? - out_size;
-                        let grad_arg =
-                            grad.conv_transpose2d(kernel, *padding, out_padding, *stride)?;
+                        let grad_arg = grad.conv_transpose2d(
+                            kernel,
+                            *padding,
+                            out_padding,
+                            *stride,
+                            *dilation,
+                        )?;
                         let sum_grad = grads.or_insert(arg)?;
                         *sum_grad = sum_grad.add(&grad_arg)?;
 
                         let grad_kernel = arg
                             .transpose(0, 1)?
-                            .conv2d(&grad.transpose(0, 1)?, *padding, *stride, 1)?
+                            .conv2d(&grad.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
                             .transpose(0, 1)?;
                         let sum_grad = grads.or_insert(kernel)?;
                         *sum_grad = sum_grad.add(&grad_kernel)?;
@@ -219,8 +226,41 @@ impl Tensor {
                     Op::ConvTranspose2D { .. } => Err(Error::BackwardNotSupported {
                         op: "conv-transpose2d",
                     })?,
-                    Op::AvgPool2D { .. } => Err(Error::BackwardNotSupported { op: "avg-pool2d" })?,
-                    Op::MaxPool2D { .. } => Err(Error::BackwardNotSupported { op: "max-pool2d" })?,
+                    Op::AvgPool2D {
+                        arg,
+                        kernel_size,
+                        stride,
+                    } => {
+                        if kernel_size != stride {
+                            crate::bail!("backward not supported for avgpool2d if ksize {kernel_size:?} != stride {stride:?}")
+                        }
+                        let (_n, _c, h, w) = arg.dims4()?;
+                        let grad_arg = grad.upsample_nearest2d(h, w)?;
+                        let grad_arg =
+                            (grad_arg * (1f64 / (kernel_size.0 * kernel_size.1) as f64))?;
+                        let sum_grad = grads.or_insert(arg)?;
+                        *sum_grad = sum_grad.add(&grad_arg)?;
+                    }
+                    Op::MaxPool2D {
+                        arg,
+                        kernel_size,
+                        stride,
+                    } => {
+                        if kernel_size != stride {
+                            crate::bail!("backward not supported for maxpool2d if ksize {kernel_size:?} != stride {stride:?}")
+                        }
+                        let (_n, _c, h, w) = arg.dims4()?;
+                        // For computing the max-pool gradient, we compute a mask where a 1 means
+                        // that the element is the maximum, then we apply this mask to the
+                        // upsampled gradient (taking into account that multiple max may exist so
+                        // we scale the gradient for this case).
+                        let node_upsampled = node.upsample_nearest2d(h, w)?;
+                        let mask = arg.eq(&node_upsampled)?.to_dtype(arg.dtype())?;
+                        let avg = mask.avg_pool2d(*kernel_size, *stride)?;
+                        let grad_arg = ((grad * avg)?.upsample_nearest2d(h, w)? * mask)?;
+                        let sum_grad = grads.or_insert(arg)?;
+                        *sum_grad = sum_grad.add(&grad_arg)?;
+                    }
                     Op::UpsampleNearest2D { .. } => Err(Error::BackwardNotSupported {
                         op: "upsample-nearest2d",
                     })?,
