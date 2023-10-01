@@ -85,7 +85,7 @@ const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
 pub struct BlockQ8_1 {
     pub(crate) d: f16,
     pub(crate) s: f16,
-    pub(crate) qs: [u8; QK8_1],
+    pub(crate) qs: [i8; QK8_1],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ8_1>() == 36);
 
@@ -225,6 +225,9 @@ impl GgmlType for BlockQ4_0 {
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q4_0_q8_0(n, xs, ys);
 
+        #[cfg(target_feature = "simd128")]
+        return super::simd128::vec_dot_q4_0_q8_0(n, xs, ys);
+
         let qk = QK8_0;
         let nb = n / qk;
         if n % QK8_0 != 0 {
@@ -278,6 +281,7 @@ impl GgmlType for BlockQ4_1 {
             }
 
             sumf += sumi as f32 * f16::to_f32(xs.d) * f16::to_f32(ys.d)
+                + f16::to_f32(xs.m) * f16::to_f32(ys.s)
         }
         Ok(sumf)
     }
@@ -471,6 +475,7 @@ impl GgmlType for BlockQ5_1 {
             }
 
             sumf += sumi as f32 * f16::to_f32(xs.d) * f16::to_f32(ys.d)
+                + f16::to_f32(xs.m) * f16::to_f32(ys.s)
         }
         Ok(sumf)
     }
@@ -604,6 +609,9 @@ impl GgmlType for BlockQ8_0 {
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q8_0_q8_0(n, xs, ys);
 
+        #[cfg(target_feature = "simd128")]
+        return super::simd128::vec_dot_q8_0_q8_0(n, xs, ys);
+
         let qk = QK8_0;
         if n % QK8_0 != 0 {
             crate::bail!("vec_dot_q8_0_q8_0: {n} is not divisible by {qk}")
@@ -652,8 +660,8 @@ impl GgmlType for BlockQ8_1 {
             for j in 0..Self::BLCK_SIZE / 2 {
                 let v0 = xs[j] * id;
                 let v1 = xs[j + Self::BLCK_SIZE / 2] * id;
-                ys.qs[j] = f32::round(v0) as u8;
-                ys.qs[j + Self::BLCK_SIZE / 2] = f32::round(v1) as u8;
+                ys.qs[j] = f32::round(v0) as i8;
+                ys.qs[j + Self::BLCK_SIZE / 2] = f32::round(v1) as i8;
                 sum += ys.qs[j] as i32 + ys.qs[j + Self::BLCK_SIZE / 2] as i32;
             }
             ys.s = f16::from_f32(sum as f32) * ys.d;
@@ -679,6 +687,9 @@ impl GgmlType for BlockQ2K {
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q2k_q8k(n, xs, ys);
 
+        #[cfg(target_feature = "simd128")]
+        return super::simd128::vec_dot_q2k_q8k(n, xs, ys);
+
         if n % QK_K != 0 {
             crate::bail!("vec_dot_q2k_q8k: {n} is not divisible by {QK_K}")
         }
@@ -699,18 +710,17 @@ impl GgmlType for BlockQ2K {
 
             let mut isum = 0;
             let mut is = 0;
-            let mut d;
             for _ in 0..(QK_K / 128) {
                 let mut shift = 0;
                 for _ in 0..4 {
-                    d = (sc[is] & 0xF) as i32;
+                    let d = (sc[is] & 0xF) as i32;
                     is += 1;
                     let mut isuml = 0;
                     for l in 0..16 {
                         isuml += q8[l] as i32 * (((q2[l] >> shift) & 3) as i32);
                     }
                     isum += d * isuml;
-                    d = (sc[is] & 0xF) as i32;
+                    let d = (sc[is] & 0xF) as i32;
                     is += 1;
                     isuml = 0;
                     for l in 16..32 {
@@ -1075,7 +1085,6 @@ impl GgmlType for BlockQ3K {
             let d_all = block.d.to_f32();
             let mut m = 1;
             let mut is = 0;
-            let mut dl;
 
             // Dequantize both 128 long blocks
             // 32 qs values per 128 long block
@@ -1086,7 +1095,7 @@ impl GgmlType for BlockQ3K {
                     for (scale_index, scale_scoped_y) in
                         shift_scoped_y.chunks_exact_mut(16).enumerate()
                     {
-                        dl = d_all * (scales[is] as f32 - 32.0);
+                        let dl = d_all * (scales[is] as f32 - 32.0);
                         for (i, inner_y) in scale_scoped_y.iter_mut().enumerate() {
                             let new_y = dl
                                 * (((qs[i + 16 * scale_index] >> shift) & 3) as i8
@@ -1123,6 +1132,9 @@ impl GgmlType for BlockQ4K {
 
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q4k_q8k(n, xs, ys);
+
+        #[cfg(target_feature = "simd128")]
+        return super::simd128::vec_dot_q4k_q8k(n, xs, ys);
 
         if n % QK_K != 0 {
             crate::bail!("vec_dot_q4k_q8k: {n} is not divisible by {QK_K}")

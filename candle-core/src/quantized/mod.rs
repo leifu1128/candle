@@ -7,6 +7,8 @@ pub mod gguf_file;
 pub mod k_quants;
 #[cfg(target_feature = "neon")]
 pub mod neon;
+#[cfg(target_feature = "simd128")]
+pub mod simd128;
 pub mod utils;
 
 pub use k_quants::GgmlType;
@@ -229,12 +231,20 @@ impl QTensor {
     }
 }
 
-#[derive(Debug)]
-pub struct QMatMul(QTensor);
+#[derive(Clone, Debug)]
+pub struct QMatMul(std::sync::Arc<QTensor>);
 
 impl QMatMul {
-    pub fn from_qtensor(qtensor: QTensor) -> Self {
+    pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Self {
         Self(qtensor)
+    }
+
+    pub fn from_qtensor(qtensor: QTensor) -> Self {
+        Self(std::sync::Arc::new(qtensor))
+    }
+
+    pub fn inner(&self) -> &std::sync::Arc<QTensor> {
+        &self.0
     }
 }
 
@@ -279,6 +289,6 @@ impl crate::CustomOp1 for QTensor {
 
 impl QMatMul {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.apply_op1_no_bwd(&self.0)
+        xs.apply_op1_no_bwd(self.0.as_ref())
     }
 }

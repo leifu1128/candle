@@ -1,8 +1,10 @@
+//! Tensors are N-dimenional matrixes of elements using a single data type.
 #![allow(clippy::redundant_closure_call)]
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{
     BackpropOp, BinaryOp, CmpOp, CustomOp1, CustomOp2, CustomOp3, Op, ReduceOp, UnaryOp,
 };
+use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims};
 use crate::{storage::Storage, DType, Device, Error, Layout, Result, Shape};
 use std::sync::{Arc, RwLock};
@@ -98,6 +100,28 @@ macro_rules! binary_op {
                 rhs.layout(),
             )?;
             let op = BackpropOp::new2(self, rhs, |t1, t2| Op::Binary(t1, t2, BinaryOp::$op_name));
+            Ok(from_storage(storage, shape.clone(), op, false))
+        }
+    };
+}
+
+macro_rules! binary_op_scalar {
+    ($fn_name:ident, $op_name:ident) => {
+        pub fn $fn_name<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
+            let rhs = match rhs.to_tensor_scalar()? {
+                crate::scalar::TensorScalar::Tensor(rhs) => rhs,
+                crate::scalar::TensorScalar::Scalar(rhs) => rhs
+                    .to_dtype(self.dtype())?
+                    .to_device(self.device())?
+                    .broadcast_as(self.shape())?,
+            };
+            let shape = self.same_shape_binary_op(&rhs, stringify!($fn_name))?;
+            let storage = self.storage().binary_impl::<crate::op::$op_name>(
+                &*rhs.storage(),
+                self.layout(),
+                rhs.layout(),
+            )?;
+            let op = BackpropOp::new2(self, &rhs, |t1, t2| Op::Binary(t1, t2, BinaryOp::$op_name));
             Ok(from_storage(storage, shape.clone(), op, false))
         }
     };
@@ -445,8 +469,8 @@ impl Tensor {
     binary_op!(mul, Mul);
     binary_op!(sub, Sub);
     binary_op!(div, Div);
-    binary_op!(maximum, Maximum);
-    binary_op!(minimum, Minimum);
+    binary_op_scalar!(maximum, Maximum);
+    binary_op_scalar!(minimum, Minimum);
     broadcast_binary_op!(broadcast_add, add);
     broadcast_binary_op!(broadcast_mul, mul);
     broadcast_binary_op!(broadcast_sub, sub);
@@ -460,10 +484,13 @@ impl Tensor {
     unary_op!(log, Log);
     unary_op!(sin, Sin);
     unary_op!(cos, Cos);
+    unary_op!(tanh, Tanh);
     unary_op!(abs, Abs);
     unary_op!(sqr, Sqr);
     unary_op!(sqrt, Sqrt);
     unary_op!(gelu, Gelu);
+    unary_op!(gelu_erf, GeluErf);
+    unary_op!(erf, Erf);
     unary_op!(relu, Relu);
 
     /// Retrieves the single scalar value hold in the tensor. If the tensor contains multiple
@@ -641,7 +668,12 @@ impl Tensor {
         let storage = self.storage().reduce_op(op, self.layout(), &[dim])?;
         let mut dims = self.dims().to_vec();
         dims[dim] = 1;
-        let op = BackpropOp::new1(self, |arg| Op::Reduce(arg, op, dims.to_vec()));
+        let op = match op {
+            ReduceOp::Sum | ReduceOp::Min | ReduceOp::Max => {
+                BackpropOp::new1(self, |arg| Op::Reduce(arg, op, dims.to_vec()))
+            }
+            ReduceOp::ArgMin | ReduceOp::ArgMax => BackpropOp::none(),
+        };
         let res = from_storage(storage, dims, op, false);
         if keepdim {
             Ok(res)
@@ -730,18 +762,24 @@ impl Tensor {
         self.sum_impl(mean_dims, false)? * scale
     }
 
+    /// Gathers the maximum value across the selected dimension. The resulting shape has the same
+    /// number of dimensions as the original tensor and the select dimension has a single element.
     pub fn max_keepdim<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, true, ReduceOp::Max)
     }
 
+    /// Similar to `max_keepdim` but the target dimension is squeezed.
     pub fn max<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, false, ReduceOp::Max)
     }
 
+    /// Gathers the minimum value across the selected dimension. The resulting shape has the same
+    /// number of dimensions as the original tensor and the select dimension has a single element.
     pub fn min_keepdim<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, true, ReduceOp::Min)
     }
 
+    /// Similar to `min_keepdim` but the target dimension is squeezed.
     pub fn min<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, false, ReduceOp::Min)
     }
@@ -750,6 +788,7 @@ impl Tensor {
         self.reduce_impl(dim, true, ReduceOp::ArgMax)
     }
 
+    /// Similar to `argmax_keepdim` but the target dimension is squeezed.
     pub fn argmax<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, false, ReduceOp::ArgMax)
     }
@@ -758,12 +797,24 @@ impl Tensor {
         self.reduce_impl(dim, true, ReduceOp::ArgMin)
     }
 
+    /// Similar to `argmin_keepdim` but the target dimension is squeezed.
     pub fn argmin<D: Dim>(&self, dim: D) -> Result<Self> {
         self.reduce_impl(dim, false, ReduceOp::ArgMin)
     }
 
-    pub fn cmp(&self, rhs: &Self, op: CmpOp) -> Result<Self> {
-        let shape = self.same_shape_binary_op(rhs, "cmp")?;
+    /// Element-wise comparison between two tensors, e.g. equality, greater than, ... The actual
+    /// comparison operation is specified by the `op` argument.
+    ///
+    /// The returned tensor has the same shape as the original tensors and uses `u8` elements.
+    pub fn cmp<T: TensorOrScalar>(&self, rhs: T, op: CmpOp) -> Result<Self> {
+        let rhs = match rhs.to_tensor_scalar()? {
+            crate::scalar::TensorScalar::Tensor(rhs) => rhs,
+            crate::scalar::TensorScalar::Scalar(rhs) => rhs
+                .to_dtype(self.dtype())?
+                .to_device(self.device())?
+                .broadcast_as(self.shape())?,
+        };
+        let shape = self.same_shape_binary_op(&rhs, "cmp")?;
         let storage = self
             .storage()
             .cmp(op, &rhs.storage(), self.layout(), rhs.layout())?;
@@ -771,31 +822,69 @@ impl Tensor {
         Ok(from_storage(storage, shape.dims(), op, false))
     }
 
-    pub fn eq(&self, rhs: &Self) -> Result<Self> {
+    /// Element-wise equality.
+    pub fn eq<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Eq)
     }
 
-    pub fn ne(&self, rhs: &Self) -> Result<Self> {
+    /// Element-wise non-equality.
+    pub fn ne<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Ne)
     }
 
-    pub fn lt(&self, rhs: &Self) -> Result<Self> {
+    /// Element-wise comparison with lower-than, the returned tensor uses value 1 where `self <
+    /// rhs` and 0 otherwise.
+    pub fn lt<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Lt)
     }
 
-    pub fn gt(&self, rhs: &Self) -> Result<Self> {
+    /// Element-wise comparison with greater-than, the returned tensor uses value 1 where `self >
+    /// rhs` and 0 otherwise.
+    pub fn gt<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Gt)
     }
 
-    pub fn ge(&self, rhs: &Self) -> Result<Self> {
+    /// Element-wise comparison with greater-equal, the returned tensor uses value 1 where `self >=
+    /// rhs` and 0 otherwise.
+    pub fn ge<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Ge)
     }
 
-    pub fn le(&self, rhs: &Self) -> Result<Self> {
+    /// Element-wise comparison with lower-equal, the returned tensor uses value 1 where `self <=
+    /// rhs` and 0 otherwise.
+    pub fn le<T: TensorOrScalar>(&self, rhs: T) -> Result<Self> {
         self.cmp(rhs, CmpOp::Le)
     }
 
-    pub fn upsample_nearest2d(&self, target_h: usize, target_w: usize) -> Result<Self> {
+    /// Clamp the tensor values to be between `min` and `max`.
+    pub fn clamp<T1: TensorOrScalar, T2: TensorOrScalar>(&self, min: T1, max: T2) -> Result<Self> {
+        self.maximum(min)?.minimum(max)
+    }
+
+    /// Interpolate the input tensor to the `target_size` size, taking the value of the nearest element.
+    ///
+    /// The input tensor should have three dimensions, `(batch, channels, l)`, the returned
+    /// tensor also has three dimensions, `(batch, channels, target_size)`.
+    pub fn interpolate1d(&self, target_size: usize) -> Result<Self> {
+        let (n, c, _l) = self.dims3()?;
+        let op = BackpropOp::new1(self, Op::UpsampleNearest1D);
+        let storage = self
+            .storage()
+            .upsample_nearest1d(self.layout(), target_size)?;
+        Ok(from_storage(storage, (n, c, target_size), op, false))
+    }
+
+    /// Alias for `interpolate1d`.
+    pub fn upsample_nearest1d(&self, target_size: usize) -> Result<Self> {
+        self.interpolate1d(target_size)
+    }
+
+    /// Interpolate the input tensor to the `(target_h, target_w)` size, taking the value of the
+    /// nearest element.
+    ///
+    /// The input tensor should have four dimensions, `(batch, channels, h, w)`, the returned
+    /// tensor also has four dimensions, `(batch, channels, target_h, target_w)`.
+    pub fn interpolate2d(&self, target_h: usize, target_w: usize) -> Result<Self> {
         let (n, c, _h, _w) = self.dims4()?;
         let op = BackpropOp::new1(self, Op::UpsampleNearest2D);
         let storage = self
@@ -804,11 +893,24 @@ impl Tensor {
         Ok(from_storage(storage, (n, c, target_h, target_w), op, false))
     }
 
+    /// Alias for `interpolate2d`.
+    pub fn upsample_nearest2d(&self, target_h: usize, target_w: usize) -> Result<Self> {
+        self.interpolate2d(target_h, target_w)
+    }
+
+    /// 2D average pooling over an input tensor with multiple channels.
+    ///
+    /// The input tensor should have four dimensions, `(batch, channels, h, w)`, the returned
+    /// tensor also has four dimensions, `(batch, channels, h', w')`. The pooling is performed on
+    /// the two last dimensions using a kernel of size `sz`. The returned element is the average
+    /// value over the kernel window.
     pub fn avg_pool2d<T: crate::ToUsize2>(&self, sz: T) -> Result<Self> {
         let sz = sz.to_usize2();
         self.avg_pool2d_with_stride(sz, sz)
     }
 
+    /// Same as `avg_pool2d` but with a `stride` that can be set to a value different from the
+    /// kernel size.
     pub fn avg_pool2d_with_stride<T: crate::ToUsize2>(
         &self,
         kernel_size: T,
@@ -831,11 +933,19 @@ impl Tensor {
         Ok(from_storage(storage, (n, c, h_out, w_out), op, false))
     }
 
+    /// 2D max pooling over an input tensor with multiple channels.
+    ///
+    /// The input tensor should have four dimensions, `(batch, channels, h, w)`, the returned
+    /// tensor also has four dimensions, `(batch, channels, h', w')`. The pooling is performed on
+    /// the two last dimensions using a kernel of size `sz`, the returned element is the maximum
+    /// value over the kernel window.
     pub fn max_pool2d<T: crate::ToUsize2>(&self, sz: T) -> Result<Self> {
         let sz = sz.to_usize2();
         self.max_pool2d_with_stride(sz, sz)
     }
 
+    /// Same as `max_pool2d` but with a `stride` that can be set to a value different from the
+    /// kernel size.
     pub fn max_pool2d_with_stride<T: crate::ToUsize2>(
         &self,
         kernel_size: T,
@@ -1022,6 +1132,75 @@ impl Tensor {
         Ok(from_storage(storage, self.shape(), op, false))
     }
 
+    /// Embeds the values of the `src` tensor into the `self` tensor on the specified dimension.
+    pub fn slice_scatter<D: Dim>(&self, src: &Self, dim: D, start: usize) -> Result<Self> {
+        let dim = dim.to_index(self.shape(), "slice-scatter")?;
+        if dim == 0 {
+            self.slice_scatter0(src, start)
+        } else {
+            // TODO: Maybe we want to add a more efficient implementation at some point.
+            self.transpose(0, dim)?
+                .slice_scatter0(&src.transpose(0, dim)?, start)?
+                .transpose(0, dim)
+        }
+    }
+
+    /// Embeds the values of the `src` tensor into the `self` tensor on the first dimension.
+    pub fn slice_scatter0(&self, src: &Self, start: usize) -> Result<Self> {
+        if self.dtype() != src.dtype() {
+            Err(Error::DTypeMismatchBinaryOp {
+                lhs: self.dtype(),
+                rhs: src.dtype(),
+                op: "slice-scatter",
+            }
+            .bt())?
+        }
+        if self.device().location() != src.device.location() {
+            Err(Error::DeviceMismatchBinaryOp {
+                lhs: self.device().location(),
+                rhs: src.device().location(),
+                op: "slice-scatter",
+            }
+            .bt())?
+        }
+        if self.rank() != src.rank() {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: self.rank(),
+                got: src.rank(),
+                shape: src.shape().clone(),
+            }
+            .bt())?
+        }
+        let shape_ok =
+            self.dims()
+                .iter()
+                .zip(src.dims().iter())
+                .enumerate()
+                .all(|(dim_idx, (&d1, &d2))| {
+                    if 0 == dim_idx {
+                        d2 + start <= d1
+                    } else {
+                        d1 == d2
+                    }
+                });
+        if !shape_ok {
+            Err(Error::ShapeMismatchBinaryOp {
+                op: "slice-scatter (self, src)",
+                lhs: self.shape().clone(),
+                rhs: src.shape().clone(),
+            })?
+        }
+        let mut storage = self.device().zeros(self.shape(), self.dtype())?;
+        self.storage()
+            .copy_strided_src(&mut storage, 0, self.layout())?;
+        let offset = start * src.dims()[1..].iter().product::<usize>();
+        src.storage()
+            .copy_strided_src(&mut storage, offset, src.layout())?;
+        let op = BackpropOp::new2(self, src, |t1, t2| Op::SliceScatter0(t1, t2, start));
+        Ok(from_storage(storage, self.shape(), op, false))
+    }
+
+    /// Accumulate element from `source` at indexes `indexes` and add them to `self`.
     pub fn index_add<D: Dim>(&self, indexes: &Self, source: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "index-add")?;
         let source_dims = source.dims();
@@ -1070,6 +1249,17 @@ impl Tensor {
         Ok(from_storage(storage, self.shape(), op, false))
     }
 
+    /// Gather values across the target dimension.
+    ///
+    /// # Arguments
+    ///
+    /// * `self` - The input tensor.
+    /// * `indexes` - The indices of elements to gather, this should have the same shape as `self`
+    ///   but can have a different number of elements on the target dimension.
+    /// * `dim` - the target dimension.
+    ///
+    /// The resulting tensor has the same shape as `indexes` and use values from `self` indexed on
+    /// dimension `dim` by the values in `indexes`.
     pub fn gather<D: Dim>(&self, indexes: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "gather")?;
         let self_dims = self.dims();
@@ -1100,6 +1290,13 @@ impl Tensor {
         Ok(from_storage(storage, indexes.shape(), op, false))
     }
 
+    /// Select values for the input tensor at the target indexes across the specified dimension.
+    ///
+    /// The `indexes` is argument is an int tensor with a single dimension.
+    /// The output has the same number of dimension as the `self` input. The target dimension of
+    /// the output has length the length of `indexes` and the values are taken from `self` using
+    /// the index from `indexes`. Other dimensions have the same number of elements as the input
+    /// tensor.
     pub fn index_select<D: Dim>(&self, indexes: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "index-select")?;
         let indexes_len = match indexes.dims() {
@@ -1307,6 +1504,10 @@ impl Tensor {
         self.sum(dims)
     }
 
+    pub fn mean_all(&self) -> Result<Tensor> {
+        self.sum_all()? / self.elem_count() as f64
+    }
+
     fn flatten_<D1: Dim, D2: Dim>(
         &self,
         start_dim: Option<D1>,
@@ -1415,6 +1616,9 @@ impl Tensor {
     pub fn transpose<D1: Dim, D2: Dim>(&self, dim1: D1, dim2: D2) -> Result<Tensor> {
         let dim1 = dim1.to_index(self.shape(), "transpose")?;
         let dim2 = dim2.to_index(self.shape(), "transpose")?;
+        if dim1 == dim2 {
+            return Ok(self.clone());
+        }
         let op = BackpropOp::new1(self, |t| Op::Transpose(t, dim1, dim2));
         let tensor_ = Tensor_ {
             id: TensorId::new(),
@@ -1617,11 +1821,14 @@ impl Tensor {
         Ok(from_storage(storage, shape, BackpropOp::none(), true))
     }
 
-    // TODO: Do we want to allow target shape using -1 on some dimensions?
     /// Reshape returns a tensor with the target shape provided that the number of elements of the
     /// original tensor is the same.
     /// If the input tensor is contiguous, this is a view on the original data. Otherwise this uses
     /// a new storage and copies the data over, the returned tensor is always contiguous.
+    ///
+    /// The shape can be specified using a tuple of `usize` and at most one `()` in which case
+    /// the behavior is the same as when using `-1` in PyTorch: this dimension size is adjusted so
+    /// as to match the number of elements in the tensor.
     ///
     /// ```rust
     /// # use candle_core::{Tensor, DType, Device, D};
@@ -1632,10 +1839,14 @@ impl Tensor {
     ///
     /// let c = a.reshape((3, 2))?;
     /// assert_eq!(c.shape().dims(), &[3, 2]);
+    ///
+    /// let c = a.reshape((2, (), 1))?;
+    /// assert_eq!(c.shape().dims(), &[2, 3, 1]);
+    ///
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn reshape<S: Into<Shape>>(&self, shape: S) -> Result<Tensor> {
-        let shape = shape.into();
+    pub fn reshape<S: crate::shape::ShapeWithOneHole>(&self, s: S) -> Result<Tensor> {
+        let shape = s.into_shape(self.elem_count())?;
         if shape.elem_count() != self.elem_count() {
             return Err(Error::ShapeMismatchBinaryOp {
                 lhs: self.shape().clone(),
@@ -1769,6 +1980,34 @@ impl Tensor {
         for arg in args {
             arg.as_ref().check_dim(dim, "cat")?;
         }
+        for (arg_idx, arg) in args.iter().enumerate() {
+            let arg = arg.as_ref();
+            if arg0.rank() != arg.rank() {
+                Err(Error::UnexpectedNumberOfDims {
+                    expected: arg0.rank(),
+                    got: arg.rank(),
+                    shape: arg.shape().clone(),
+                }
+                .bt())?
+            }
+            for (dim_idx, (v1, v2)) in arg0
+                .shape()
+                .dims()
+                .iter()
+                .zip(arg.shape().dims().iter())
+                .enumerate()
+            {
+                if dim_idx != dim && v1 != v2 {
+                    Err(Error::ShapeMismatchCat {
+                        dim: dim_idx,
+                        first_shape: arg0.shape().clone(),
+                        n: arg_idx + 1,
+                        nth_shape: arg.shape().clone(),
+                    }
+                    .bt())?
+                }
+            }
+        }
         if dim == 0 {
             Self::cat0(args)
         } else {
@@ -1858,6 +2097,8 @@ impl Tensor {
         Ok(from_storage(storage, shape, op, false))
     }
 
+    /// Pad the input tensor using 0s along dimension `dim`. This adds `left` elements before the
+    /// input tensor values and `right` elements after.
     pub fn pad_with_zeros<D: Dim>(&self, dim: D, left: usize, right: usize) -> Result<Self> {
         if left == 0 && right == 0 {
             Ok(self.clone())
@@ -1884,6 +2125,7 @@ impl Tensor {
         }
     }
 
+    /// Run the `forward` method of `m` on `self`.
     pub fn apply<M: crate::Module>(&self, m: &M) -> Result<Self> {
         m.forward(self)
     }
@@ -2022,6 +2264,22 @@ macro_rules! bin_trait {
             }
         }
 
+        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<Tensor> for Result<B> {
+            type Output = Result<Tensor>;
+
+            fn $fn1(self, rhs: Tensor) -> Self::Output {
+                Tensor::$fn1(self?.borrow(), &rhs)
+            }
+        }
+
+        impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<&Tensor> for Result<B> {
+            type Output = Result<Tensor>;
+
+            fn $fn1(self, rhs: &Tensor) -> Self::Output {
+                Tensor::$fn1(self?.borrow(), rhs)
+            }
+        }
+
         impl<B: std::borrow::Borrow<Tensor>> std::ops::$trait<Result<B>> for Tensor {
             type Output = Result<Tensor>;
 
@@ -2060,3 +2318,69 @@ bin_trait!(Add, add, |_| 1., |v| v);
 bin_trait!(Sub, sub, |_| 1., |v: f64| -v);
 bin_trait!(Mul, mul, |v| v, |_| 0.);
 bin_trait!(Div, div, |v| 1. / v, |_| 0.);
+
+impl std::ops::Add<Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    fn add(self, rhs: Tensor) -> Self::Output {
+        rhs + self
+    }
+}
+
+impl std::ops::Add<&Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    fn add(self, rhs: &Tensor) -> Self::Output {
+        rhs + self
+    }
+}
+
+impl std::ops::Mul<Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    fn mul(self, rhs: Tensor) -> Self::Output {
+        rhs * self
+    }
+}
+
+impl std::ops::Mul<&Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    fn mul(self, rhs: &Tensor) -> Self::Output {
+        rhs * self
+    }
+}
+
+impl std::ops::Sub<Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    fn sub(self, rhs: Tensor) -> Self::Output {
+        rhs.affine(-1., self)
+    }
+}
+
+impl std::ops::Sub<&Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    fn sub(self, rhs: &Tensor) -> Self::Output {
+        rhs.affine(-1., self)
+    }
+}
+
+impl std::ops::Div<Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    #[allow(clippy::suspicious_arithmetic_impl)]
+    fn div(self, rhs: Tensor) -> Self::Output {
+        rhs.recip()? * self
+    }
+}
+
+impl std::ops::Div<&Tensor> for f64 {
+    type Output = Result<Tensor>;
+
+    #[allow(clippy::suspicious_arithmetic_impl)]
+    fn div(self, rhs: &Tensor) -> Self::Output {
+        rhs.recip()? * self
+    }
+}

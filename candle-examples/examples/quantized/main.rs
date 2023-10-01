@@ -12,10 +12,17 @@ use candle::quantized::{ggml_file, gguf_file};
 use candle::{Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 
-mod model;
+use candle_transformers::models::quantized_llama as model;
 use model::ModelWeights;
 
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
+
+#[derive(Debug)]
+enum Prompt {
+    Interactive,
+    Chat,
+    One(String),
+}
 
 #[derive(Clone, Debug, Copy, ValueEnum)]
 enum Which {
@@ -37,6 +44,10 @@ enum Which {
     L13bCode,
     #[value(name = "32b-code")]
     L34bCode,
+    #[value(name = "7b-mistral")]
+    Mistral7b,
+    #[value(name = "7b-mistral-instruct")]
+    Mistral7bInstruct,
 }
 
 #[derive(Parser, Debug)]
@@ -46,7 +57,9 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    /// The initial prompt.
+    /// The initial prompt, use 'interactive' for entering multiple prompts in an interactive way
+    /// and 'chat' for an interactive model where history of previous prompts and generated tokens
+    /// is preserved.
     #[arg(long)]
     prompt: Option<String>,
 
@@ -58,9 +71,13 @@ struct Args {
     #[arg(long)]
     tokenizer: Option<String>,
 
-    /// The temperature used to generate samples.
+    /// The temperature used to generate samples, use 0 for greedy sampling.
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f64,
+
+    /// Nucleus sampling probability cutoff.
     #[arg(long)]
-    temperature: Option<f64>,
+    top_p: Option<f64>,
 
     /// The seed to use when generating random samples.
     #[arg(long, default_value_t = 299792458)]
@@ -75,7 +92,7 @@ struct Args {
     verbose_prompt: bool,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.1)]
     repeat_penalty: f32,
 
     /// The context size to consider for the repeat penalty.
@@ -97,7 +114,19 @@ impl Args {
             Some(config) => std::path::PathBuf::from(config),
             None => {
                 let api = hf_hub::api::sync::Api::new()?;
-                let api = api.model("hf-internal-testing/llama-tokenizer".to_string());
+                let repo = match self.which {
+                    Which::L7b
+                    | Which::L13b
+                    | Which::L70b
+                    | Which::L7bCode
+                    | Which::L13bCode
+                    | Which::L34bCode
+                    | Which::L7bChat
+                    | Which::L13bChat
+                    | Which::L70bChat => "hf-internal-testing/llama-tokenizer",
+                    Which::Mistral7b | Which::Mistral7bInstruct => "mistralai/Mistral-7B-v0.1",
+                };
+                let api = api.model(repo.to_string());
                 api.get("tokenizer.json")?
             }
         };
@@ -127,6 +156,14 @@ impl Args {
                     Which::L7bCode => ("TheBloke/CodeLlama-7B-GGUF", "codellama-7b.Q8_0.gguf"),
                     Which::L13bCode => ("TheBloke/CodeLlama-13B-GGUF", "codellama-13b.Q8_0.gguf"),
                     Which::L34bCode => ("TheBloke/CodeLlama-34B-GGUF", "codellama-34b.Q8_0.gguf"),
+                    Which::Mistral7b => (
+                        "TheBloke/Mistral-7B-v0.1-GGUF",
+                        "mistral-7b-v0.1.Q4_K_S.gguf",
+                    ),
+                    Which::Mistral7bInstruct => (
+                        "TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
+                        "mistral-7b-instruct-v0.1.Q4_K_S.gguf",
+                    ),
                 };
                 let api = hf_hub::api::sync::Api::new()?;
                 let api = api.model(repo.to_string());
@@ -179,6 +216,11 @@ fn main() -> anyhow::Result<()> {
     use tracing_subscriber::prelude::*;
 
     let args = Args::parse();
+    let temperature = if args.temperature == 0. {
+        None
+    } else {
+        Some(args.temperature)
+    };
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
         tracing_subscriber::registry().with(chrome_layer).init();
@@ -193,6 +235,10 @@ fn main() -> anyhow::Result<()> {
         candle::utils::with_neon(),
         candle::utils::with_simd128(),
         candle::utils::with_f16c()
+    );
+    println!(
+        "temp: {:.2} repeat-penalty: {:.2} repeat-last-n: {}",
+        args.temperature, args.repeat_penalty, args.repeat_last_n
     );
 
     let model_path = args.model()?;
@@ -239,7 +285,7 @@ fn main() -> anyhow::Result<()> {
                 | Which::L7bCode
                 | Which::L13bCode
                 | Which::L34bCode => 1,
-                Which::L70b | Which::L70bChat => 8,
+                Which::Mistral7b | Which::Mistral7bInstruct | Which::L70b | Which::L70bChat => 8,
             };
             ModelWeights::from_ggml(model, args.gqa.unwrap_or(default_gqa))?
         }
@@ -247,62 +293,103 @@ fn main() -> anyhow::Result<()> {
     println!("model built");
 
     let tokenizer = args.tokenizer()?;
-    let prompt = args.prompt.as_ref().map_or(DEFAULT_PROMPT, |p| p.as_str());
-    let tokens = tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?;
-    if args.verbose_prompt {
-        for (token, id) in tokens.get_tokens().iter().zip(tokens.get_ids().iter()) {
-            let token = token.replace('▁', " ").replace("<0x0A>", "\n");
-            println!("{id:7} -> '{token}'");
+    let prompt = match args.prompt.as_deref() {
+        Some("chat") => Prompt::Chat,
+        Some("interactive") => Prompt::Interactive,
+        Some(s) => Prompt::One(s.to_string()),
+        None => Prompt::One(DEFAULT_PROMPT.to_string()),
+    };
+
+    let mut pre_prompt_tokens = vec![];
+    loop {
+        let prompt_str = match &prompt {
+            Prompt::One(prompt) => prompt.clone(),
+            Prompt::Interactive | Prompt::Chat => {
+                print!("> ");
+                std::io::stdout().flush()?;
+                let mut prompt = String::new();
+                std::io::stdin().read_line(&mut prompt)?;
+                if prompt.ends_with('\n') {
+                    prompt.pop();
+                    if prompt.ends_with('\r') {
+                        prompt.pop();
+                    }
+                }
+                prompt
+            }
+        };
+        print!("{}", &prompt_str);
+        let tokens = tokenizer
+            .encode(prompt_str, true)
+            .map_err(anyhow::Error::msg)?;
+        if args.verbose_prompt {
+            for (token, id) in tokens.get_tokens().iter().zip(tokens.get_ids().iter()) {
+                let token = token.replace('▁', " ").replace("<0x0A>", "\n");
+                println!("{id:7} -> '{token}'");
+            }
+        }
+
+        let prompt_tokens = [&pre_prompt_tokens, tokens.get_ids()].concat();
+        let to_sample = args.sample_len.saturating_sub(1);
+        let prompt_tokens = if prompt_tokens.len() + to_sample > model::MAX_SEQ_LEN - 10 {
+            let to_remove = prompt_tokens.len() + to_sample + 10 - model::MAX_SEQ_LEN;
+            prompt_tokens[prompt_tokens.len().saturating_sub(to_remove)..].to_vec()
+        } else {
+            prompt_tokens
+        };
+        let mut all_tokens = vec![];
+        let mut logits_processor = LogitsProcessor::new(args.seed, temperature, args.top_p);
+
+        let start_prompt_processing = std::time::Instant::now();
+        let mut next_token = {
+            let input = Tensor::new(prompt_tokens.as_slice(), &Device::Cpu)?.unsqueeze(0)?;
+            let logits = model.forward(&input, 0)?;
+            let logits = logits.squeeze(0)?;
+            logits_processor.sample(&logits)?
+        };
+        let prompt_dt = start_prompt_processing.elapsed();
+        all_tokens.push(next_token);
+        print_token(next_token, &tokenizer);
+
+        let start_post_prompt = std::time::Instant::now();
+        for index in 0..to_sample {
+            let input = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
+            let logits = model.forward(&input, prompt_tokens.len() + index)?;
+            let logits = logits.squeeze(0)?;
+            let logits = if args.repeat_penalty == 1. {
+                logits
+            } else {
+                let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    args.repeat_penalty,
+                    &all_tokens[start_at..],
+                )?
+            };
+            next_token = logits_processor.sample(&logits)?;
+            all_tokens.push(next_token);
+            print_token(next_token, &tokenizer);
+        }
+        let dt = start_post_prompt.elapsed();
+        println!(
+            "\n\n{:4} prompt tokens processed: {:.2} token/s",
+            prompt_tokens.len(),
+            prompt_tokens.len() as f64 / prompt_dt.as_secs_f64(),
+        );
+        println!(
+            "{:4} tokens generated: {:.2} token/s",
+            to_sample,
+            to_sample as f64 / dt.as_secs_f64(),
+        );
+
+        match prompt {
+            Prompt::One(_) => break,
+            Prompt::Interactive => {}
+            Prompt::Chat => {
+                pre_prompt_tokens = [prompt_tokens.as_slice(), all_tokens.as_slice()].concat()
+            }
         }
     }
 
-    let prompt_tokens = tokens.get_ids().to_vec();
-    let mut all_tokens = vec![];
-    let mut logits_processor = LogitsProcessor::new(args.seed, args.temperature);
-
-    print!("{prompt}");
-
-    let start_prompt_processing = std::time::Instant::now();
-    let mut next_token = {
-        let input = Tensor::new(prompt_tokens.as_slice(), &Device::Cpu)?.unsqueeze(0)?;
-        let logits = model.forward(&input, 0)?;
-        let logits = logits.squeeze(0)?;
-        logits_processor.sample(&logits)?
-    };
-    let prompt_dt = start_prompt_processing.elapsed();
-    all_tokens.push(next_token);
-    print_token(next_token, &tokenizer);
-
-    let to_sample = args.sample_len.saturating_sub(1);
-    let start_post_prompt = std::time::Instant::now();
-    for index in 0..to_sample {
-        let input = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
-        let logits = model.forward(&input, prompt_tokens.len() + index)?;
-        let logits = logits.squeeze(0)?;
-        let logits = if args.repeat_penalty == 1. {
-            logits
-        } else {
-            let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
-                &logits,
-                args.repeat_penalty,
-                &all_tokens[start_at..],
-            )?
-        };
-        next_token = logits_processor.sample(&logits)?;
-        all_tokens.push(next_token);
-        print_token(next_token, &tokenizer);
-    }
-    let dt = start_post_prompt.elapsed();
-    println!(
-        "\n\n{:4} prompt tokens processed: {:.2} token/s",
-        prompt_tokens.len(),
-        prompt_tokens.len() as f64 / prompt_dt.as_secs_f64(),
-    );
-    println!(
-        "{:4} tokens generated: {:.2} token/s",
-        to_sample,
-        to_sample as f64 / dt.as_secs_f64(),
-    );
     Ok(())
 }

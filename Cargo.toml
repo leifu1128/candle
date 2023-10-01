@@ -8,17 +8,19 @@ members = [
     "candle-pyo3",
     "candle-transformers",
     "candle-wasm-examples/llama2-c",
+    "candle-wasm-examples/segment-anything",
     "candle-wasm-examples/whisper",
     "candle-wasm-examples/yolo",
+    "candle-wasm-examples/bert",
+    "candle-wasm-examples/phi",
+    "candle-wasm-examples/t5",
+    "candle-wasm-tests",
 ]
-exclude = [
-    "candle-flash-attn",
-    "candle-kernels",
-]
+exclude = ["candle-flash-attn", "candle-kernels"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.3"
 edition = "2021"
 description = "Minimalist ML framework."
 repository = "https://github.com/huggingface/candle"
@@ -33,7 +35,7 @@ byteorder = "1.4.3"
 clap = { version = "4.2.4", features = ["derive"] }
 cudarc = { version = "0.9.14", features = ["f16"] }
 # TODO: Switch back to the official gemm implementation once it has caught up.
-gemm = { version = "0.15.6", package = "candle-gemm" }
+gemm = { version = "0.16.0", package = "candle-gemm" }
 hf-hub = "0.3.0"
 half = { version = "2.3.1", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 image = { version = "0.24.7", default-features = false, features = ["jpeg", "png"] }
@@ -41,9 +43,10 @@ imageproc = { version = "0.23.0", default-features = false }
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
 libc = { version = "0.2.147" }
 log = "0.4"
-memmap2 = "0.7.1"
+memmap2 = { version = "0.7.1", features = ["stable_deref_trait"] }
 num_cpus = "1.15.0"
 num-traits = "0.2.15"
+parquet = { version = "45.0.0" }
 rand = "0.8.5"
 rand_distr = "0.4.3"
 rayon = "1.7.0"
@@ -57,8 +60,8 @@ tracing = "0.1.37"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.7"
 wav = "1.0.0"
+yoke = { version = "0.7.2", features = ["derive"] }
 zip = { version = "0.6.6", default-features = false }
-parquet = { version = "45.0.0" }
 
 [profile.release-with-debug]
 inherits = "release"
