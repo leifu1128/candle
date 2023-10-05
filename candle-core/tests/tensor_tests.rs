@@ -93,6 +93,18 @@ fn unary_op(device: &Device) -> Result<()> {
             [0.9999, -0.9891, -0.3079, 0.9891, 0.9999]
         ]
     );
+    assert_eq!(
+        test_utils::to_vec2_round(&tensor.ceil()?, 4)?,
+        [[-3.0, 1.0, 4.0, -0.0, 1.0], [3.0, -1.0, -0.0, 2.0, 3.0]]
+    );
+    assert_eq!(
+        test_utils::to_vec2_round(&tensor.floor()?, 4)?,
+        [[-3.0, 1.0, 4.0, -1.0, 0.0], [2.0, -2.0, -1.0, 1.0, 2.0]]
+    );
+    assert_eq!(
+        test_utils::to_vec2_round(&tensor.round()?, 4)?,
+        [[-3.0, 1.0, 4.0, -0.0, 1.0], [3.0, -2.0, -0.0, 2.0, 3.0]]
+    );
     Ok(())
 }
 
@@ -652,6 +664,21 @@ fn index_select(device: &Device) -> Result<()> {
     assert_eq!(
         hs.to_vec2::<f32>()?,
         &[[0.0, 1.0, 2.0], [6.0, 7.0, 8.0], [3.0, 4.0, 5.0]]
+    );
+    // Prior to https://github.com/huggingface/candle/pull/1022
+    // There would be a bug where the last values in the result tensor would be set to 0.
+    let ids = Tensor::new(&[0u32, 2u32, 1u32, 0u32, 2u32, 1u32], device)?;
+    let hs = t.index_select(&ids, 0)?;
+    assert_eq!(
+        hs.to_vec2::<f32>()?,
+        &[
+            [0.0, 1.0, 2.0],
+            [6.0, 7.0, 8.0],
+            [3.0, 4.0, 5.0],
+            [0.0, 1.0, 2.0],
+            [6.0, 7.0, 8.0],
+            [3.0, 4.0, 5.0],
+        ]
     );
     Ok(())
 }

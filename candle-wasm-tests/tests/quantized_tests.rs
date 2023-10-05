@@ -41,7 +41,7 @@ fn quantized_matmul_neg() -> Result<()> {
     );
 
     let qtensor = quantized::QTensor::new(rhs_t, (4, 64))?;
-    let matmul = quantized::QMatMul::from_qtensor(qtensor);
+    let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
     let res = matmul.forward(&tensor_lhs)?;
     assert_eq!(
         to_vec2_round(&res, 0)?,
@@ -82,6 +82,9 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         GgmlDType::Q5_0 => 0.001353,
         GgmlDType::Q5_1 => 0.001363,
         GgmlDType::Q8_0 => 0.000092,
+
+        // Not from the ggml repo.
+        GgmlDType::Q8K => 0.00065,
         _ => candle::bail!("No GGML results for quantization type {dtype:?}",),
     };
     Ok(err)
@@ -100,7 +103,14 @@ fn ggml_matmul_error_test<T: GgmlType>() -> Result<()> {
     T::VecDotType::from_float(&b, &mut b_quant)?;
 
     let result = T::vec_dot(length, &a_quant, &b_quant)?;
+    let result_unopt = T::vec_dot_unopt(length, &a_quant, &b_quant)?;
     let reference_result = vec_dot_reference(&a, &b);
+
+    if (result - result_unopt).abs() / length as f32 > 1e-6 {
+        candle::bail!(
+            "the opt and unopt vec-dot returned different values, opt {result}, unopt {result_unopt}"
+        )
+    }
 
     let error = (result - reference_result).abs() / length as f32;
 
@@ -172,5 +182,11 @@ fn quantized_matmul_q5k() -> Result<()> {
 #[wasm_bindgen_test]
 fn quantized_matmul_q6k() -> Result<()> {
     ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ6K>()?;
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+fn quantized_matmul_q8k() -> Result<()> {
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ8K>()?;
     Ok(())
 }

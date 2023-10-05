@@ -1,23 +1,6 @@
+use super::Config;
 use candle::{Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv1d, Conv1dConfig, Embedding, LayerNorm, Module, VarBuilder};
-use serde::Deserialize;
-
-// The names in comments correspond to the original implementation:
-// https://github.com/openai/whisper/blob/f572f2161ba831bae131364c3bffdead7af6d210/whisper/model.py#L17
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Config {
-    pub num_mel_bins: usize,            // n_mels
-    pub max_source_positions: usize,    // n_audio_ctx
-    pub d_model: usize,                 // n_audio_state
-    pub encoder_attention_heads: usize, // n_audio_head
-    pub encoder_layers: usize,          // n_audio_layer
-    pub vocab_size: usize,              // n_vocab
-    pub max_target_positions: usize,    //  n_text_ctx
-    // pub n_text_state: usize,
-    pub decoder_attention_heads: usize, // n_text_head
-    pub decoder_layers: usize,          // n_text_layer
-    pub suppress_tokens: Vec<u32>,
-}
 
 fn embedding(vocab_size: usize, hidden_size: usize, vb: VarBuilder) -> Result<Embedding> {
     let embeddings = vb.get((vocab_size, hidden_size), "weight")?;
